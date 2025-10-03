@@ -1,13 +1,24 @@
 from models.api_worker import APIWorker
 from models.face_detection_engine import FaceDetectionEngine
 from models.authentication_engine import AuthenticationEngine
+from models.communication_engine import CommunicationEngine
 import threading
 import cv2
 from datetime import datetime
 from ultralytics import YOLO
+import argparse
+import socket
+import platform
 
 
 def main():
+    parser = argparse.ArgumentParser(description="PhizRecon Camera Client")
+    parser.add_argument("--comm-server", help="Communication server URL (e.g., ws://localhost:3000)")
+    parser.add_argument("--camera-id", type=int, help="Camera ID for server identification")
+    parser.add_argument("--camera-name", help="Camera name for identification")
+    parser.add_argument("--device-index", type=int, default=0, help="Camera device index")
+    args = parser.parse_args()
+    
     base_url = "https://10.130.64.245:7059"
     api_endpoint = f"{base_url}/Image"
     model_path = 'ml_model/best.pt'
@@ -15,12 +26,26 @@ def main():
     api_worker = APIWorker(base_url=base_url)
     face_detection_engine = FaceDetectionEngine(api_url=base_url)
     
+    comm_engine = None
+    if args.comm_server:
+        comm_engine = CommunicationEngine(
+            server_url=args.comm_server,
+            camera_id=args.camera_id,
+            camera_name=args.camera_name,
+            device_index=args.device_index
+        )
+        print(f"Communication server configured: {args.comm_server}")
+        comm_engine.start_communication_thread()
+    else:
+        print("No communication server specified - running in standalone mode")
+    
     api_thread = threading.Thread(target=api_worker.api_worker, args=(api_endpoint,), daemon=True)
     api_thread.start()
     
-    cap = cv2.VideoCapture(0)
+    device_idx = args.device_index if args.device_index is not None else 0
+    cap = cv2.VideoCapture(device_idx)
     if not cap.isOpened():
-        print("Error: Could not open webcam.")
+        print(f"Error: Could not open webcam device {device_idx}.")
         return
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)   
@@ -36,8 +61,11 @@ def main():
     last_results = None
     display_frame_skip = 2
     display_count = 0
+    comm_frame_skip = 5
     
     print("Starting optimized face detection for Raspberry Pi...")
+    if comm_engine:
+        print(f"Communication enabled - will stream to {args.comm_server}")
 
     last_image_time = datetime.min
     while True:
@@ -48,6 +76,9 @@ def main():
 
         frame_count += 1
         display_count += 1
+
+        if comm_engine and frame_count % comm_frame_skip == 0:
+            comm_engine.queue_frame(frame)
 
         if frame_count % frame_skip == 0:
             process_frame = cv2.resize(frame, (320, 240))
@@ -75,11 +106,8 @@ def main():
                     zoomed_face_resized = cv2.resize(zoomed_face, (160, 160))
                     timestamp = now.strftime("%Y%m%d_%H%M%S")
                     
-                    cv2.imwrite(f"detected_face_{timestamp}.jpg", zoomed_face_resized, 
-                               [cv2.IMWRITE_JPEG_QUALITY, 85])
-                    
                     api_worker.queue.put(zoomed_face_resized)
-                    print(f"Picture taken and queued for API at {timestamp}")
+                    print(f"Face detected - queued for API authentication at {timestamp}")
                     last_image_time = now
         
         if last_results is not None and len(last_results[0].boxes) > 0:
@@ -99,13 +127,25 @@ def main():
             now = datetime.now().strftime("%H:%M:%S")
             cv2.putText(frame, "PhizRecon", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
             cv2.putText(frame, now, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            
+            if comm_engine:
+                status_text = f"Comm: {comm_engine.camera_name}"
+                cv2.putText(frame, status_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            
             cv2.imshow("Webcam", frame)
         
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
 
-    api_worker.queue.put(None)  
+    print("Shutting down...")
+    
+    api_worker.queue.put(None)
+    
+    if comm_engine:
+        comm_engine.stop()
+        print("Communication engine stopped")
+    
     cap.release()
     cv2.destroyAllWindows()
     print("Application stopped.")
