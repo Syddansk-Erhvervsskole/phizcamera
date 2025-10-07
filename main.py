@@ -20,7 +20,7 @@ def main():
     parser.add_argument("--no-display", action="store_true", help="Run without camera display window")
     args = parser.parse_args()
     
-    base_url = "https://10.130.64.245:7059"
+    base_url = "http://10.130.56.51"
     api_endpoint = f"{base_url}/Image"
     model_path = 'ml_model/best.pt'
 

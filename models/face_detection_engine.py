@@ -7,7 +7,7 @@ from models.authentication_engine import AuthenticationEngine
 class FaceDetectionEngine:
     def __init__(self, api_url):
         self.api_url = api_url
-        self.auth_engine = AuthenticationEngine(auth_url="https://10.130.64.245:7059/User/Login")
+        self.auth_engine = AuthenticationEngine(auth_url="http://10.130.56.51/User/Login")
 
     def send_face_to_api(self, face_image):
         try:
