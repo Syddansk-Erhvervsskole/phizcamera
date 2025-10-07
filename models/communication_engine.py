@@ -36,30 +36,34 @@ class CommunicationEngine:
             print(f"Connecting to communication server: {self.server_url}")
             self.ws = await websockets.connect(self.server_url)
             
-            await self.ws.send(json.dumps({
+            identify_message = {
                 'type': 'identify',
                 'role': 'producer', 
                 'client_type': 'camera',
                 'camera_id': str(self.camera_id),
                 'camera_name': self.camera_name
-            }))
+            }
             
+            await self.ws.send(json.dumps(identify_message))
             print(f"✓ Connected to server as {self.camera_name} (ID: {self.camera_id})")
+            print(f"✓ WebSocket connection established and ready for frame streaming")
             return True
             
         except Exception as e:
             print(f"✗ Failed to connect to communication server: {e}")
+            self.ws = None
             return False
     
     def _is_connected(self):
         try:
-            return self.ws is not None and hasattr(self.ws, 'open') and self.ws.open
+            return self.ws is not None
         except:
             return False
     
     async def send_frame(self, frame):
         try:
             if not self._is_connected():
+                print("WebSocket not connected - cannot send frame")
                 return False
                 
             if frame.shape[:2] != (480, 640):
@@ -68,17 +72,19 @@ class CommunicationEngine:
             _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
             frame_b64 = base64.b64encode(buffer).decode('utf-8')
             
-            await self.ws.send(json.dumps({
+            message = json.dumps({
                 'type': 'frame',
                 'frameData': frame_b64,
                 'camera_id': str(self.camera_id),
                 'timestamp': time.time()
-            }))
+            })
             
+            await self.ws.send(message)
             return True
             
         except websockets.exceptions.ConnectionClosed:
             print("Communication server disconnected")
+            self.ws = None
             return False
         except Exception as e:
             print(f"Error sending frame to communication server: {e}")
@@ -104,6 +110,12 @@ class CommunicationEngine:
     
     async def frame_sender_worker(self):
         frame_count = 0
+        failed_attempts = 0
+        max_failed_attempts = 10
+        last_success_time = time.time()
+        
+        print("Frame sender worker started")
+        
         while self.running:
             try:
                 if not self.frame_queue.empty():
@@ -112,12 +124,28 @@ class CommunicationEngine:
                     
                     if success:
                         frame_count += 1
-                        if frame_count % 100 == 0:
-                            print(f"Sent {frame_count} frames to communication server")
+                        failed_attempts = 0
+                        last_success_time = time.time()
+                        if frame_count % 50 == 0:
+                            print(f"✓ Sent {frame_count} frames to communication server")
                     else:
-                        if not await self.connect_server():
-                            print("Failed to reconnect to communication server")
-                            await asyncio.sleep(5) 
+                        failed_attempts += 1
+                        if failed_attempts % 5 == 0:
+                            print(f"⚠ Failed to send {failed_attempts} frames. Connection status: {self._is_connected()}")
+                        
+                        if failed_attempts >= max_failed_attempts:
+                            print(f"⚠ Multiple send failures detected. Attempting reconnection...")
+                            if await self.connect_server():
+                                print("✓ Reconnected successfully")
+                                failed_attempts = 0
+                            else:
+                                print("✗ Reconnection failed, continuing...")
+                                await asyncio.sleep(2)
+                                failed_attempts = 0
+                else:
+                    if time.time() - last_success_time > 30:
+                        print(f"ℹ Frame sender active - queue empty. Frames sent: {frame_count}")
+                        last_success_time = time.time()
                 
                 await asyncio.sleep(0.1)
                 

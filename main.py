@@ -17,15 +17,13 @@ def main():
     parser.add_argument("--camera-id", type=int, help="Camera ID for server identification")
     parser.add_argument("--camera-name", help="Camera name for identification")
     parser.add_argument("--device-index", type=int, default=0, help="Camera device index")
+    parser.add_argument("--no-display", action="store_true", help="Run without camera display window")
     args = parser.parse_args()
     
     base_url = "https://10.130.64.245:7059"
     api_endpoint = f"{base_url}/Image"
     model_path = 'ml_model/best.pt'
 
-    api_worker = APIWorker(base_url=base_url)
-    face_detection_engine = FaceDetectionEngine(api_url=base_url)
-    
     comm_engine = None
     if args.comm_server:
         comm_engine = CommunicationEngine(
@@ -36,11 +34,18 @@ def main():
         )
         print(f"Communication server configured: {args.comm_server}")
         comm_engine.start_communication_thread()
+        
+        api_worker = None
+        face_detection_engine = None
+        print("Running in communication-only mode - face detection disabled")
     else:
+        api_worker = APIWorker(base_url=base_url)
+        face_detection_engine = FaceDetectionEngine(api_url=base_url)
         print("No communication server specified - running in standalone mode")
     
-    api_thread = threading.Thread(target=api_worker.api_worker, args=(api_endpoint,), daemon=True)
-    api_thread.start()
+    if api_worker:
+        api_thread = threading.Thread(target=api_worker.api_worker, args=(api_endpoint,), daemon=True)
+        api_thread.start()
     
     device_idx = args.device_index if args.device_index is not None else 0
     cap = cv2.VideoCapture(device_idx)
@@ -53,8 +58,11 @@ def main():
     cap.set(cv2.CAP_PROP_FPS, 15)            
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)     
     
-    model = YOLO(model_path)
-    model.to('cpu')
+    model = None
+    if face_detection_engine:
+        model = YOLO(model_path)
+        model.to('cpu')
+        print("Starting optimized face detection for Raspberry Pi...")
     
     frame_skip = 3 
     frame_count = 0
@@ -63,9 +71,10 @@ def main():
     display_count = 0
     comm_frame_skip = 5
     
-    print("Starting optimized face detection for Raspberry Pi...")
     if comm_engine:
         print(f"Communication enabled - will stream to {args.comm_server}")
+        if args.no_display or not face_detection_engine:
+            print("Display disabled - running headless")
 
     last_image_time = datetime.min
     while True:
@@ -80,7 +89,7 @@ def main():
         if comm_engine and frame_count % comm_frame_skip == 0:
             comm_engine.queue_frame(frame)
 
-        if frame_count % frame_skip == 0:
+        if model and frame_count % frame_skip == 0:
             process_frame = cv2.resize(frame, (320, 240))
             results = model(process_frame, verbose=False, imgsz=320)
             last_results = results
@@ -106,24 +115,26 @@ def main():
                     zoomed_face_resized = cv2.resize(zoomed_face, (160, 160))
                     timestamp = now.strftime("%Y%m%d_%H%M%S")
                     
-                    api_worker.queue.put(zoomed_face_resized)
-                    print(f"Face detected - queued for API authentication at {timestamp}")
+                    if api_worker:
+                        api_worker.queue.put(zoomed_face_resized)
+                        print(f"Face detected - queued for API authentication at {timestamp}")
                     last_image_time = now
         
-        if last_results is not None and len(last_results[0].boxes) > 0:
-            for box in last_results[0].boxes:
-                scale_x = frame.shape[1] / 320
-                scale_y = frame.shape[0] / 240
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                x1, x2 = int(x1 * scale_x), int(x2 * scale_x)
-                y1, y2 = int(y1 * scale_y), int(y2 * scale_y)
-                conf = float(box.conf[0])
-                label = "Face" if int(box.cls[0]) == 0 else model.names[int(box.cls[0])]
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                cv2.putText(frame, f"{label} {conf:.2f}", (x1, y1 - 10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        if not args.no_display and not (comm_engine and not face_detection_engine):
+            if last_results is not None and len(last_results[0].boxes) > 0:
+                for box in last_results[0].boxes:
+                    scale_x = frame.shape[1] / 320
+                    scale_y = frame.shape[0] / 240
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    x1, x2 = int(x1 * scale_x), int(x2 * scale_x)
+                    y1, y2 = int(y1 * scale_y), int(y2 * scale_y)
+                    conf = float(box.conf[0])
+                    label = "Face" if int(box.cls[0]) == 0 else model.names[int(box.cls[0])]
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                    cv2.putText(frame, f"{label} {conf:.2f}", (x1, y1 - 10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         
-        if display_count % display_frame_skip == 0:
+        if not args.no_display and not (comm_engine and not face_detection_engine) and display_count % display_frame_skip == 0:
             now = datetime.now().strftime("%H:%M:%S")
             cv2.putText(frame, "PhizRecon", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
             cv2.putText(frame, now, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
@@ -140,14 +151,16 @@ def main():
 
     print("Shutting down...")
     
-    api_worker.queue.put(None)
+    if api_worker:
+        api_worker.queue.put(None)
     
     if comm_engine:
         comm_engine.stop()
         print("Communication engine stopped")
     
     cap.release()
-    cv2.destroyAllWindows()
+    if not args.no_display and not (comm_engine and not face_detection_engine):
+        cv2.destroyAllWindows()
     print("Application stopped.")
 
 if __name__ == "__main__":
